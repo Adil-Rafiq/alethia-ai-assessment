@@ -81,18 +81,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--k", type=int, default=0, help="frames sampled per second (0 = every frame)")
+    ap.add_argument("--k", type=int, default=3, help="frames sampled per second (0 = every frame)")
     ap.add_argument("--workers", type=int, default=max(1, min(16, (os.cpu_count() or 4) - 2)))
-    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--batch", type=int, default=8, help="must be <= the engine's max batch (prepare.py)")
     ap.add_argument("--weights", default=None)
-    ap.add_argument("--half", action="store_true")
+    ap.add_argument("--fp32", action="store_true", help="FP32 instead of FP16 (reference runs)")
+    ap.add_argument("--skip-nonref", action="store_true", help="don't decode non-reference frames")
     ap.add_argument("--max-videos", type=int, default=0, help="dev: stop after N videos")
     ap.add_argument("--max-seconds", type=int, default=0, help="dev: only first N seconds per video")
     args = ap.parse_args()
 
     t0 = time.time()
     files = sorted(glob.glob(os.path.join(args.input, "*.parquet")))
-    log(f"{len(files)} parquet files, k={args.k}, workers={args.workers}, batch={args.batch}")
+    log(f"{len(files)} parquet files, k={args.k}, workers={args.workers}, batch={args.batch}, "
+        f"fp32={args.fp32}, skip_nonref={args.skip_nonref}")
     writer = Writer(args.output)
 
     ctx = mp.get_context("spawn")
@@ -100,7 +102,8 @@ def main():
     out_q = ctx.Queue(maxsize=256)
 
     def spawn(wid):
-        p = ctx.Process(target=worker_main, args=(wid, task_q, out_q, args.k, args.max_seconds), daemon=True)
+        p = ctx.Process(target=worker_main, args=(wid, task_q, out_q, args.k, args.max_seconds, args.skip_nonref),
+                        daemon=True)
         p.start()
         return p
 
@@ -111,7 +114,10 @@ def main():
 
     from indexer.detect import Detector, aggregate  # imports torch (after workers started)
 
-    det = Detector(args.weights or default_weights(), half=args.half)
+    det = Detector(args.weights or default_weights(), half=not args.fp32)
+    tm = {"gpu": 0.0, "wait": 0.0}  # where the main process spends its time
+    t_ready = time.time()
+    log(f"model loaded in {t_ready - t0:.1f}s")
 
     videos = {}  # vid -> {"secs": {sec: [(labels, people)]}, "inflight": int, "end": (last, err)|None}
     current = {}  # wid -> vid being decoded
@@ -138,12 +144,14 @@ def main():
         if n_videos % 20 == 0:
             el = time.time() - t0
             log(f"{n_videos} videos, {n_secs} s of video, {n_frames} frames inferred, "
-                f"{el:.0f}s elapsed, {n_secs / el:.1f} video-s/s")
+                f"{el:.0f}s elapsed, {n_secs / el:.1f} video-s/s, gpu {tm['gpu']:.0f}s, wait {tm['wait']:.0f}s")
 
     def run_bucket(shape):
         nonlocal n_frames
         items = buckets.pop(shape)
+        t = time.time()
         results = det([img for _, _, img in items])
+        tm["gpu"] += time.time() - t
         n_frames += len(items)
         touched = set()
         for (vid, sec, _), res in zip(items, results):
@@ -157,10 +165,12 @@ def main():
             maybe_finish(vid)
 
     while wdone < args.workers or buckets:
+        t = time.time()
         try:
             msg = out_q.get(timeout=0.05)
         except queue.Empty:
             msg = None
+        tm["wait"] += time.time() - t
         if msg is None:
             if buckets:  # GPU idle: run the biggest partial batch
                 run_bucket(max(buckets, key=lambda s: len(buckets[s])))
@@ -207,7 +217,8 @@ def main():
         maybe_finish(vid)
     writer.close()
     el = time.time() - t0
-    log(f"DONE: {n_videos} videos, {n_secs} s of video, {n_frames} frames in {el:.1f}s")
+    log(f"DONE: {n_videos} videos, {n_secs} s of video, {n_frames} frames in {el:.1f}s "
+        f"(model load {t_ready - t0:.1f}s, gpu {tm['gpu']:.1f}s, waiting on decoders {tm['wait']:.1f}s)")
 
 
 if __name__ == "__main__":

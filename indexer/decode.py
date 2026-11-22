@@ -45,7 +45,7 @@ def pick(frames, k):
     return [frames[int((j + 0.5) * n / k)] for j in range(k)]
 
 
-def decode_video(vid, data, k, emit, max_seconds=0):
+def decode_video(vid, data, k, emit, max_seconds=0, skip_nonref=False):
     """Decode one video, emitting ('frames', vid, sec, n_in_second, [imgs]) per second.
 
     Returns (last_sec, error_or_None). last_sec is the highest second that had a frame.
@@ -62,26 +62,40 @@ def decode_video(vid, data, k, emit, max_seconds=0):
         container = av.open(io.BytesIO(data), metadata_errors="ignore")
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
+        if skip_nonref:
+            # Don't decode frames nothing else references (usually B-frames): ~2x less decode work.
+            # Sampling only needs *some* frames per second; seconds are still timed from packet pts.
+            stream.codec_context.skip_frame = "NONREF"
         tb = stream.time_base
         rate = stream.average_rate or stream.guessed_rate or Fraction(30)
-        pts0, idx = None, 0
-        for frame in container.decode(stream):
-            if frame.pts is not None and tb is not None:
-                if pts0 is None:
-                    pts0 = frame.pts
-                t = (frame.pts - pts0) * tb
-            else:
-                t = Fraction(idx) / Fraction(rate)
-            idx += 1
-            sec = max(0, math.floor(t))
-            if max_seconds and sec >= max_seconds:
+        pts0, idx, max_pkt_pts = None, 0, None
+        stop = False
+        for packet in container.demux(stream):
+            if packet.pts is not None and packet.size:
+                max_pkt_pts = packet.pts if max_pkt_pts is None else max(max_pkt_pts, packet.pts)
+            for frame in packet.decode():
+                if frame.pts is not None and tb is not None:
+                    if pts0 is None:
+                        pts0 = frame.pts
+                    t = (frame.pts - pts0) * tb
+                else:
+                    t = Fraction(idx) / Fraction(rate)
+                idx += 1
+                sec = max(0, math.floor(t))
+                if max_seconds and sec >= max_seconds:
+                    stop = True
+                    break
+                if sec != cur_sec:
+                    flush()
+                    cur_sec, buf = sec, []
+                buf.append(frame)
+                last_sec = max(last_sec, sec)
+            if stop:
                 break
-            if sec != cur_sec:
-                flush()
-                cur_sec, buf = sec, []
-            buf.append(frame)
-            last_sec = max(last_sec, sec)
         flush()
+        if skip_nonref and not stop and pts0 is not None and max_pkt_pts is not None and tb is not None:
+            # Skipped trailing frames still count for "up to the second holding the last frame".
+            last_sec = max(last_sec, math.floor((max_pkt_pts - pts0) * tb))
         container.close()
         if last_sec < 0:
             return last_sec, "could not decode video"
@@ -95,7 +109,7 @@ def decode_video(vid, data, k, emit, max_seconds=0):
         return last_sec, msg
 
 
-def worker_main(wid, task_q, out_q, k, max_seconds):
+def worker_main(wid, task_q, out_q, k, max_seconds, skip_nonref=False):
     cv2.setNumThreads(1)
     while True:
         task = task_q.get()
@@ -105,7 +119,7 @@ def worker_main(wid, task_q, out_q, k, max_seconds):
         vid, data = task
         out_q.put(("start", wid, vid))
         try:
-            last_sec, err = decode_video(vid, data, k, out_q.put, max_seconds)
+            last_sec, err = decode_video(vid, data, k, out_q.put, max_seconds, skip_nonref)
         except Exception:
             last_sec, err = -1, "worker error: " + traceback.format_exc(limit=1)[-150:]
         out_q.put(("end", wid, vid, last_sec, err))
