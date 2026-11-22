@@ -10,7 +10,8 @@ class Detector:
         from ultralytics import YOLO
 
         self.model = YOLO(weights, task="detect")
-        self.kw = dict(conf=CONF, iou=IOU, imgsz=IMGSZ, classes=list(CLASSES), half=half,
+        # Ultralytics 8.4 replaced `half` with `quantize` (16 = FP16, None = FP32).
+        self.kw = dict(conf=CONF, iou=IOU, imgsz=IMGSZ, classes=list(CLASSES), quantize=16 if half else None,
                        device=device, verbose=False)
 
     def __call__(self, imgs):
