@@ -1,0 +1,8 @@
+*.pt
+*.engine
+*.onnx
+*.jsonl
+__pycache__/
+.venv/
+data/
+notes.txt
